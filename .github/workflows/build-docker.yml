@@ -1,0 +1,21 @@
+name: Test build Docker image
+
+on:
+  push:
+    branches-ignore: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          push: false
+          tags: ${{ github.repository_owner }}/usbipd:latest
