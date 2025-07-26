@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+import asyncio
 import os
 import subprocess
 import sys
 import re
 import logging
+from asyncio.subprocess import Process
+from typing import Coroutine, Any
 
 # Default values
 YUBICO_VID = "1050"  # https://www.yubico.com/
@@ -27,14 +30,41 @@ def get_vid_list() -> list[str]:
         return [YUBICO_VID, TOKEN_VID]
 
 
-fssh_vid_list = get_vid_list()
 use_docker = '1' == config.get('use_docker', os.environ.get('use_docker', '1'))
 docker_container_name = config.get('docker_container_name', os.environ.get('docker_container_name', 'fido-usbipd'))
 
+fssh_vid_list = get_vid_list()
+logging.basicConfig(level=logging.INFO)
 logging.info(f"Using FIDO USB VID list: {fssh_vid_list}")
 
 
+async def open_ssh_connection(bus_ids: list[str]) -> Coroutine[Any, Any, int]:
+    # Open the SSH connection
+    logging.info(f"Opening SSH connection now. Will bind to bus IDs {bus_ids}")
+    attach_commands: list[str] = []
+    detach_commands: list[str] = []
+    for index, bus_id in enumerate(bus_ids):
+        attach_commands.append(
+            # Wait for the usbip daemon to be ready
+            # Dump the logs from the first attachment, but ignore all logs from the detachment and reattachment
+            f'sudo usbip attach -r localhost -b {bus_id} && ' +
+            f'sudo usbip detach -p {index} 2&>1 > /dev/null && ' +
+            f'sudo usbip attach -r localhost -b {bus_id} 2&>1 > /dev/null'
+        )
+        detach_commands.append(f'sudo usbip detach -p {index}')
+    ssh_cmd = [
+        'ssh', '-t', '-R', '3240:localhost:3240', *sys.argv[1:],
+        'echo "Halting SSH while host prepares usbipd..." && sleep 5 && ' +
+        ' && '.join(attach_commands) +
+        " && sudo -k && bash -i ; " + ' && '.join(detach_commands)
+    ]
+    p = await asyncio.create_subprocess_exec(ssh_cmd[0], *ssh_cmd[1:], stdout=sys.stdout, stderr=sys.stderr,
+                                             stdin=sys.stdin)
+    return p.wait()
+
+
 def check_kernel_modules():
+    logging.info("Checking for required kernel modules...")
     mods = subprocess.check_output(['sudo', 'lsmod']).decode()
     for mod in ['usbip_host', 'vhci_hcd']:
         if mod in mods:
@@ -112,10 +142,17 @@ def unbind_and_stop_container(bus_ids: list[str]):
     return retval
 
 
-def main():
+async def main():
+    # Step 1 is just get our kernel modules loaded and determine what USB devices will be forwarded to the remote
     check_kernel_modules()
     fido_docker_args = find_fido_devices()
     bus_ids = find_usbip_bus_ids()
+
+    # Next up, get that SSH connection started, in case the user is storing their SSH key on their FIDO device
+    connection_future = await open_ssh_connection(bus_ids)
+    logging.info("SSH connection fired off in the background; giving that a moment to connect")
+    await asyncio.sleep(3)
+    logging.info("Proceeding to mount FIDO devices into usbipd")
 
     # Start usbip daemon
     if not use_docker:
@@ -141,27 +178,12 @@ def main():
             unbind_and_stop_container(bound_ids)
             sys.exit(1)
 
-    # Open the SSH connection
-    logging.info(f"Opening SSH connection now. Will bind to bus IDs {bound_ids}")
-    attach_commands: list[str] = []
-    detach_commands: list[str] = []
-    for index, bus_id in enumerate(bound_ids):
-        attach_commands.append(
-            # Dump the logs from the first attachment, but ignore all logs from the detachment and reattachment
-            f'sudo usbip attach -r localhost -b {bus_id} && ' +
-            f'sudo usbip detach -p {index} 2&>1 > /dev/null && ' +
-            f'sudo usbip attach -r localhost -b {bus_id} 2&>1 > /dev/null'
-        )
-        detach_commands.append(f'sudo usbip detach -p {index}')
-    ssh_cmd = [
-        'ssh', '-t', '-R', '3240:localhost:3240', *sys.argv[1:],
-        ' && '.join(attach_commands) + " && sudo -k && bash -i ; " + ' && '.join(detach_commands)
-    ]
-    subprocess.run(ssh_cmd)
+    # Wait for the user to complete their actions
+    await connection_future
 
     # Cleanup
     unbind_and_stop_container(bound_ids)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
